@@ -218,6 +218,107 @@ def plot_factor_ic(ic_df: pd.DataFrame, save_path: Optional[str] = None, top_n: 
     plt.close(fig)
 
 
+# ─── Weekly rolling backtest chart ───────────────────────────────────────────
+
+def plot_weekly_returns(
+    weekly_df:  pd.DataFrame,
+    result=None,          # BacktestResult for cumulative curve overlay
+    benchmark:  Optional[pd.Series] = None,
+    save_path:  Optional[str] = None,
+):
+    """
+    Two-panel chart for the weekly rolling backtest:
+      Top   : cumulative equity curve (full year, with week boundaries)
+      Bottom: weekly return bar chart (green = positive week, red = negative)
+              + benchmark week return overlay
+    """
+    _apply_dark_style()
+
+    has_curve = result is not None and not result.daily.empty
+
+    fig, axes = plt.subplots(
+        2, 1, figsize=(14, 8), facecolor=DARK_BG,
+        gridspec_kw={"height_ratios": [2.5, 1.5]},
+    )
+    ax_curve, ax_bar = axes
+
+    # ── Top: cumulative equity curve ─────────────────────────────────────────
+    if has_curve:
+        equity = result.equity_curve
+        norm   = equity / equity.iloc[0]
+        ax_curve.plot(equity.index, norm, color=BLUE, lw=1.8, label="策略净值")
+
+        if benchmark is not None:
+            bm = benchmark.reindex(equity.index).fillna(0)
+            bm_cum = (1 + bm).cumprod()
+            ax_curve.plot(equity.index, bm_cum, color=ORANGE, lw=1.2,
+                          linestyle="--", label="基准净值")
+
+        # Shade alternating weeks
+        for i, (week, row) in enumerate(weekly_df.iterrows()):
+            t0 = pd.Timestamp(row["start_date"])
+            t1 = pd.Timestamp(row["end_date"])
+            c  = GREEN if row["week_return"] >= 0 else RED
+            ax_curve.axvspan(t0, t1, alpha=0.07, color=c, linewidth=0)
+
+        ax_curve.set_ylabel("净值", color=TEXT_COL)
+        ax_curve.legend(loc="upper left", fontsize=8)
+        ax_curve.axhline(1.0, color=GRID_COL, lw=0.5, linestyle=":")
+        ax_curve.set_title(
+            f"{weekly_df.index[0][:4]} 年周度滚动回测 — CloseToClose (VWAP标签)",
+            color=TEXT_COL, fontsize=10,
+        )
+    else:
+        ax_curve.set_visible(False)
+
+    # ── Bottom: weekly return bars ────────────────────────────────────────────
+    weeks       = weekly_df.index.tolist()
+    week_rets   = weekly_df["week_return"].values * 100
+    bar_colors  = [GREEN if r >= 0 else RED for r in week_rets]
+    x_pos       = np.arange(len(weeks))
+
+    ax_bar.bar(x_pos, week_rets, color=bar_colors, alpha=0.85, width=0.6, label="策略周收益")
+    ax_bar.axhline(0, color=TEXT_COL, lw=0.5)
+
+    # Benchmark bars (semi-transparent overlay)
+    if "benchmark_return" in weekly_df.columns:
+        bm_rets = weekly_df["benchmark_return"].values * 100
+        ax_bar.bar(x_pos, bm_rets, color=ORANGE, alpha=0.35, width=0.6, label="基准周收益")
+
+    # Annotate cumulative return per week
+    for i, (ret, end_val) in enumerate(zip(week_rets, weekly_df["portfolio_value_end"])):
+        sign = "+" if ret >= 0 else ""
+        ax_bar.text(i, ret + (0.15 if ret >= 0 else -0.3),
+                    f"{sign}{ret:.1f}%", ha="center", va="bottom" if ret >= 0 else "top",
+                    fontsize=6.5, color=TEXT_COL)
+
+    ax_bar.set_xticks(x_pos)
+    ax_bar.set_xticklabels(weeks, rotation=45, ha="right", fontsize=7)
+    ax_bar.set_ylabel("周收益率 (%)", color=TEXT_COL)
+    ax_bar.legend(loc="upper right", fontsize=7)
+
+    # Summary annotation
+    total_ret = (weekly_df["portfolio_value_end"].iloc[-1] /
+                 weekly_df["portfolio_value_end"].iloc[0] *
+                 (1 + weekly_df["week_return"].iloc[0]) - 1)
+    win_rate  = (weekly_df["week_return"] > 0).mean() * 100
+    ax_bar.set_title(
+        f"胜周率 {win_rate:.0f}%  |  平均Sharpe {weekly_df['sharpe'].mean():.2f}  |  "
+        f"平均仓位 {weekly_df['avg_positions'].mean():.1f}",
+        color=TEXT_COL, fontsize=8,
+    )
+
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=DARK_BG)
+        print(f"Weekly chart saved → {save_path}")
+    else:
+        plt.show()
+    plt.close(fig)
+
+
 # ─── Return distribution ──────────────────────────────────────────────────────
 
 def plot_return_distribution(daily_returns: pd.Series, save_path: Optional[str] = None):

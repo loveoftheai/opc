@@ -2,11 +2,14 @@
 LightGBM Rolling-Window Signal Model.
 
 Approach:
-  - Frame as a ranking problem: predict next-day close-to-close return.
-  - Use LightGBM with 'regression' objective (predict raw return).
+  - Frame as a ranking problem: predict next-day VWAP return
+    (Config.TARGET_COL = "target_vwap" by default).
+  - VWAP = amount / volume; using it as the label is more robust than
+    close-to-close because VWAP averages over the whole session and is
+    harder to manipulate at the close.
   - Train on a rolling window (default 252 trading days).
-  - Retrain every RETRAIN_FREQ trading days to stay adaptive.
-  - At inference time, rank stocks by predicted return and select top-N.
+  - Retrain every RETRAIN_FREQ trading days (default 5 = weekly).
+  - At inference time, rank stocks by predicted score and select top-N.
 
 The model operates purely on the factor panel produced by factors.py, so
 there is no look-ahead: all features for date T use only data up to close T.
@@ -41,8 +44,9 @@ class LGBMSignal:
     FEATURE_COLS = FactorEngine.FACTOR_COLS   # use all factors as ML features
 
     def __init__(self, config: Config = None):
-        self.cfg    = config or Config()
-        self.model_: Optional[lgb.Booster] = None
+        self.cfg       = config or Config()
+        self.target_col = getattr(self.cfg, "TARGET_COL", "target_vwap")
+        self.model_:  Optional[lgb.Booster] = None
         self.scaler_: Optional[RobustScaler] = None
         self._train_dates: list = []
 
@@ -100,7 +104,8 @@ class LGBMSignal:
 
         log.info(f"Rolling ML: {len(pred_dates_full)} prediction dates, "
                  f"window={self.cfg.ROLLING_TRAIN_WINDOW} days, "
-                 f"retrain every {self.cfg.RETRAIN_FREQ} days")
+                 f"retrain every {self.cfg.RETRAIN_FREQ} days, "
+                 f"label={self.target_col}")
 
         for i, pred_date in enumerate(pred_dates_full):
             # Retrain only at initial run or every RETRAIN_FREQ steps
@@ -120,7 +125,7 @@ class LGBMSignal:
                 train_panel = panel.loc[panel.index.get_level_values("date").isin(
                     set(train_dates)
                 )]
-                train_panel = train_panel.dropna(subset=available_features + ["target_ret"])
+                train_panel = train_panel.dropna(subset=available_features + [self.target_col])
 
                 if len(train_panel) < self.cfg.MIN_TRAIN_SAMPLES:
                     log.debug(f"  Skipping train on {pred_date.date()}: "
@@ -129,7 +134,7 @@ class LGBMSignal:
                         continue
                 else:
                     X_train = train_panel[available_features].values.astype(np.float32)
-                    y_train = train_panel["target_ret"].values.astype(np.float32)
+                    y_train = train_panel[self.target_col].values.astype(np.float32)
 
                     # Winsorise targets to ±10 %
                     y_train = np.clip(y_train, -0.10, 0.10)

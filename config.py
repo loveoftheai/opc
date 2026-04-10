@@ -44,7 +44,7 @@ class Config:
 
     # ─── ML model (LightGBM) ─────────────────────────────────────────────────
     ROLLING_TRAIN_WINDOW = 252     # trading days used for each rolling fit
-    RETRAIN_FREQ         = 21      # retrain every N trading days
+    RETRAIN_FREQ         = 5       # retrain every 5 trading days (weekly)
     MIN_TRAIN_SAMPLES    = 5_000   # minimum rows before training
     N_ESTIMATORS         = 300
     MAX_DEPTH            = 6
@@ -53,6 +53,16 @@ class Config:
     COLSAMPLE_BYTREE     = 0.8
     NUM_LEAVES           = 63
     RANDOM_STATE         = 42
+
+    # ─── Label & execution ───────────────────────────────────────────────────
+    # Use VWAP (amount/volume) as the prediction target instead of close-to-close.
+    # VWAP is harder to manipulate and more representative of true execution price.
+    TARGET_COL     = "target_vwap"  # ML label: close_T → VWAP_{T+1}
+    USE_VWAP_EXIT  = True           # backtest sell at VWAP instead of close
+
+    # ─── Rolling backtest ────────────────────────────────────────────────────
+    ROLLING_YEAR        = 2026      # year for weekly rolling backtest
+    ROLLING_WEEK_DAYS   = 5         # trading days per test window
 
     # ─── Benchmark ───────────────────────────────────────────────────────────
     BENCHMARK_CODE = "sh.000300"   # CSI 300 (baostock format)

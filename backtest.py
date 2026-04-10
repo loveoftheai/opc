@@ -83,16 +83,25 @@ class BacktestEngine:
 
     def __init__(
         self,
-        picks:  Dict[pd.Timestamp, List[str]],
-        panel:  pd.DataFrame,
-        config: Config = None,
+        picks:            Dict[pd.Timestamp, List[str]],
+        panel:            pd.DataFrame,
+        config:           Config = None,
+        initial_capital:  float  = None,   # override Config.INITIAL_CAPITAL
+        use_vwap_exit:    bool   = None,   # override Config.USE_VWAP_EXIT
     ):
         self.picks  = picks
         self.panel  = panel
         self.cfg    = config or Config()
 
+        # Allow per-call overrides (used by rolling weekly backtest)
+        cap = initial_capital if initial_capital is not None else self.cfg.INITIAL_CAPITAL
+        self._use_vwap_exit = (
+            use_vwap_exit if use_vwap_exit is not None
+            else getattr(self.cfg, "USE_VWAP_EXIT", False)
+        )
+
         # Runtime state
-        self._cash:       float             = self.cfg.INITIAL_CAPITAL
+        self._cash:       float               = cap
         self._positions:  Dict[str, Position] = {}
         self._daily:      List[DailyRecord]   = []
         self._trades:     List[Trade]          = []
@@ -106,9 +115,10 @@ class BacktestEngine:
             raise ValueError("No trading dates in picks dict.")
 
         log.info(f"Backtest: {trading_dates[0].date()} → {trading_dates[-1].date()}, "
-                 f"{len(trading_dates)} days")
+                 f"{len(trading_dates)} days, "
+                 f"vwap_exit={self._use_vwap_exit}")
 
-        prev_value = self.cfg.INITIAL_CAPITAL
+        prev_value = self._cash   # use actual starting cash (may be overridden)
 
         for date in trading_dates:
             prices = self._prices_on(date)
@@ -146,19 +156,28 @@ class BacktestEngine:
     # ─── Internal helpers ─────────────────────────────────────────────────────
 
     def _prices_on(self, date: pd.Timestamp) -> Dict[str, dict]:
-        """Return {code: {close, high, low, pctChg, amount}} for date."""
+        """Return {code: {close, vwap, high, low, pctChg, amount}} for date."""
         try:
             day_df = self.panel.xs(date, level="date")
         except KeyError:
             return {}
         result = {}
         for code, row in day_df.iterrows():
+            close  = float(row.get("close",  np.nan))
+            vol    = float(row.get("volume", 0.0))
+            amt    = float(row.get("amount", 0.0))
+            # VWAP approximation: stored in panel if FactorEngine ran, else compute
+            vwap_raw = row.get("vwap", np.nan)
+            if pd.isna(vwap_raw) and vol > 0:
+                vwap_raw = amt / vol
+            vwap = float(vwap_raw) if not pd.isna(vwap_raw) else close
             result[code] = {
-                "close":  float(row.get("close", np.nan)),
-                "high":   float(row.get("high",  np.nan)),
-                "low":    float(row.get("low",   np.nan)),
+                "close":  close,
+                "vwap":   vwap,
+                "high":   float(row.get("high",   np.nan)),
+                "low":    float(row.get("low",    np.nan)),
                 "pctChg": float(row.get("pctChg", 0.0)),
-                "amount": float(row.get("amount", 0.0)),
+                "amount": amt,
             }
         return result
 
@@ -172,7 +191,11 @@ class BacktestEngine:
                 log.debug(f"  No price for {code} on {date.date()}, holding over.")
                 continue
 
-            sell_price = p["close"]
+            # Use VWAP as the execution price when enabled (more realistic fill)
+            if self._use_vwap_exit and not np.isnan(p.get("vwap", np.nan)):
+                sell_price = p["vwap"]
+            else:
+                sell_price = p["close"]
 
             # If stock is at lower limit (−9.5 %), we're forced to sell anyway
             # (in reality you may be stuck; we assume you can sell at limit price)

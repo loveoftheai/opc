@@ -8,9 +8,17 @@ Factor categories:
   4. Technical    — RSI, MACD, Bollinger Bands, moving-average crossovers
   5. Candlestick  — intraday price pattern (close position, body, shadows)
   6. Volatility   — realized volatility at multiple horizons
+  7. VWAP         — VWAP-based momentum, deviation, and trend signals
+  8. 盘口 (order book proxy) — open auction gap, intraday trend, closing
+                               pressure, Kyle's lambda, spread proxy
 
 All factors are computed per-stock via groupby, then cross-sectionally
 z-scored (rank-based) so they are comparable across stocks and time.
+
+Targets
+-------
+  target_vwap : (VWAP_{T+1} - close_T) / close_T  [PRIMARY — used by ML]
+  target_ret  : (close_{T+1} - close_T) / close_T  [reference]
 """
 
 import numpy as np
@@ -160,7 +168,7 @@ class FactorEngine:
             grp["lower_shadow"] = lower_shadow / rng
             grp["bullish_body"] = ((c > o).astype(float) * 2 - 1)  # +1 up, -1 down
 
-            # ── 9. Overnight gap ──────────────────────────────────────────────
+            # ── 9. Overnight gap (already in 盘口 section below) ─────────────
             grp["open_gap"] = (o - c.shift(1)) / c.shift(1).replace(0, np.nan)
 
             # ── 10. Volatility ────────────────────────────────────────────────
@@ -174,6 +182,59 @@ class FactorEngine:
             # ── 11. Amihud illiquidity proxy ──────────────────────────────────
             abs_ret = c.pct_change().abs()
             grp["illiq_5d"] = (abs_ret / amt.replace(0, np.nan)).rolling(5, min_periods=3).mean()
+
+            # ── 12. VWAP features ─────────────────────────────────────────────
+            # Daily VWAP approximation = total turnover / total shares traded
+            vwap = amt / v.replace(0, np.nan)
+            grp["vwap"] = vwap                      # stored for backtest exit
+
+            # Close vs VWAP: positive → buying pressure at day end
+            grp["close_vs_vwap"]  = (c - vwap) / vwap.replace(0, np.nan)
+            # Open vs VWAP: positive → opening above the day's average price
+            grp["open_vs_vwap"]   = (o - vwap) / vwap.replace(0, np.nan)
+            # Intraday trend: VWAP vs open (did price trend up during the day?)
+            grp["intraday_trend"] = (vwap - o) / o.replace(0, np.nan)
+            # Close pressure within intraday range
+            grp["close_pressure"] = (c - vwap) / rng.replace(0, np.nan)
+
+            # VWAP momentum
+            grp["vwap_mom_5d"]  = vwap.pct_change(5)
+            grp["vwap_mom_20d"] = vwap.pct_change(20)
+
+            # VWAP deviation from its own short-term average
+            for w in [5, 10]:
+                vma = vwap.rolling(w, min_periods=w).mean()
+                grp[f"vwap_vs_ma{w}"] = (vwap - vma) / vma.replace(0, np.nan)
+
+            # ── 13. 盘口 (order book proxy) ────────────────────────────────────
+            # Open auction momentum: trend in overnight sentiment
+            grp["open_gap_ma5"]    = grp["open_gap"].rolling(5, min_periods=3).mean()
+
+            # Kyle's lambda proxy: price impact per unit volume (5-day smoothed)
+            # Larger value → stock is more illiquid / thin order book
+            grp["kyle_lambda"]     = (abs_ret / np.sqrt(amt.replace(0, np.nan))
+                                      ).rolling(5, min_periods=3).mean()
+
+            # Normalised intraday spread proxy (high-low / vwap)
+            # Narrow spread → liquid, easier to fill at desired price
+            grp["spread_proxy"]    = rng / vwap.replace(0, np.nan)
+
+            # Tick direction proxy via Tick Rule (Hasbrouck 1991 approximation)
+            # +1 = up-tick day (more buyer-initiated), -1 = down-tick
+            grp["tick_dir"]        = (c - c.shift(1)).apply(np.sign)
+            # Rolling 5-day tick direction ratio (order-flow imbalance proxy)
+            grp["tick_imbalance"]  = grp["tick_dir"].rolling(5, min_periods=3).mean()
+
+            # Volume surprise: today's volume vs 20-day average
+            vol_20ma = v.rolling(20, min_periods=10).mean()
+            grp["vol_surprise"]    = (v - vol_20ma) / vol_20ma.replace(0, np.nan)
+
+            # Price efficiency ratio: |close−open| / range (directional day strength)
+            grp["price_efficiency"] = (c - o).abs() / rng.replace(0, np.nan)
+
+            # AM/PM divergence: did closing session reverse the morning trend?
+            # close_vs_vwap > 0 and open_vs_vwap < 0 → afternoon buying surge
+            grp["am_pm_divergence"] = grp["close_vs_vwap"] - grp["open_vs_vwap"]
 
             result_frames.append(grp)
 
@@ -203,6 +264,18 @@ class FactorEngine:
         "vol_5d", "vol_20d", "vol_ratio",
         # liquidity
         "illiq_5d",
+        # ── VWAP features (added for VWAP-label strategy) ─────────────────────
+        "close_vs_vwap", "open_vs_vwap", "intraday_trend", "close_pressure",
+        "vwap_mom_5d", "vwap_mom_20d",
+        "vwap_vs_ma5", "vwap_vs_ma10",
+        # ── 盘口 proxy features ───────────────────────────────────────────────
+        "open_gap_ma5",           # trend in overnight sentiment
+        "kyle_lambda",            # price-impact / thin-book proxy
+        "spread_proxy",           # intraday bid-ask spread proxy
+        "tick_imbalance",         # order-flow direction imbalance (5-day)
+        "vol_surprise",           # abnormal volume signal
+        "price_efficiency",       # directional day strength
+        "am_pm_divergence",       # AM vs PM session divergence
     ]
 
     def _normalise_cs(self, panel: pd.DataFrame) -> pd.DataFrame:
@@ -217,24 +290,33 @@ class FactorEngine:
         panel = panel.groupby(level="date", group_keys=False).apply(_rank_group)
         return panel
 
-    # ─── Target variable ──────────────────────────────────────────────────────
+    # ─── Target variables ─────────────────────────────────────────────────────
 
     def _add_target(self, panel: pd.DataFrame) -> pd.DataFrame:
         """
-        target_ret: next-day close-to-close return (what we trade).
-        Computed per-stock to avoid look-ahead via groupby shift.
+        Compute both targets per-stock (strict no-look-ahead via groupby+shift):
+
+        target_vwap : (VWAP_{T+1} − close_T) / close_T   [PRIMARY ML label]
+            Buy at close T, sell at tomorrow's VWAP = amount_{T+1}/volume_{T+1}.
+            More realistic than close-to-close; VWAP is harder to manipulate.
+
+        target_ret  : (close_{T+1} − close_T) / close_T   [reference only]
         """
-        def _next_ret(grp):
-            grp["target_ret"] = grp["close"].pct_change(1).shift(-1)
+        def _targets(grp):
+            # VWAP target: shift(-1) gives next day's VWAP
+            vwap = grp["amount"] / grp["volume"].replace(0, np.nan)
+            grp["target_vwap"] = (vwap.shift(-1) - grp["close"]) / grp["close"].replace(0, np.nan)
+            # Close-to-close reference
+            grp["target_ret"]  = grp["close"].pct_change(1).shift(-1)
             return grp
 
-        panel = panel.groupby(level="code", group_keys=False).apply(_next_ret)
+        panel = panel.groupby(level="code", group_keys=False).apply(_targets)
         return panel
 
     # ─── Factor IC analysis ───────────────────────────────────────────────────
 
     def compute_ic(self, panel: pd.DataFrame, factor_col: str,
-                   target_col: str = "target_ret") -> pd.Series:
+                   target_col: str = "target_vwap") -> pd.Series:
         """
         Return daily IC (rank correlation between factor and next-day return).
         Useful for evaluating individual factor quality.
