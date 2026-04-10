@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# data cache (large parquet files — download locally)
+data/
+
+# runtime outputs (regenerated each run)
+output/
+
+# model checkpoints
+*.pkl
+
+# notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
